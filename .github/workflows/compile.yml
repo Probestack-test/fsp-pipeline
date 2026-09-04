@@ -1,0 +1,45 @@
+name: Enhancement Compile
+
+on:
+  workflow_dispatch:
+    inputs:
+      enhancement_run_id:
+        description: "The enhancement run this compile is for (correlation only)"
+        required: true
+      zip_url:
+        description: "Signed URL to download the source zip from (pom.xml at zip root)"
+        required: true
+      java_version:
+        description: "JDK major version to compile with"
+        required: true
+        default: "17"
+
+run-name: "compile-${{ inputs.enhancement_run_id }}"
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source zip
+        run: curl -sL -o source.zip "${{ inputs.zip_url }}"
+
+      - name: Unzip source
+        run: |
+          mkdir -p source
+          unzip -q source.zip -d source
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Compile
+        working-directory: source
+        run: |
+          if [ -f "./mvnw" ]; then
+            chmod +x ./mvnw
+            ./mvnw -B -DskipTests compile
+          else
+            mvn -B -DskipTests compile
+          fi
