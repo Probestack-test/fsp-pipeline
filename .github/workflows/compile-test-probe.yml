@@ -19,7 +19,7 @@ jobs:
       - name: Download ZIP
         run: |
           echo "pretending to download..."
-          sleep 3
+          sleep 2
 
       - name: Unzip
         run: |
@@ -28,8 +28,8 @@ jobs:
 
       - name: Compile
         run: |
-          for i in $(seq 1 12); do
-            echo "compile progress line $i of 12"
+          for i in $(seq 1 40); do
+            echo "compile progress line $i of 40"
             sleep 2
           done
           echo "COMPILE_DONE_MARKER"
