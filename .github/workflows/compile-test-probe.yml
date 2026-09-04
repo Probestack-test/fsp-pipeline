@@ -28,8 +28,8 @@ jobs:
 
       - name: Compile
         run: |
-          for i in $(seq 1 40); do
-            echo "compile progress line $i of 40"
+          for i in $(seq 1 150); do
+            echo "compile progress line $i of 150"
             sleep 2
           done
           echo "COMPILE_DONE_MARKER"
