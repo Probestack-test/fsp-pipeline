@@ -118,6 +118,18 @@ jobs:
           ref: ${{ env.EFFECTIVE_BRANCH }}
 
 
+      - name: Verify checkout branch
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "head_ref=${{ github.head_ref }}"
+          echo "base_ref=${{ github.base_ref }}"
+          echo "input_branch=${{ inputs.branch_name }}"
+          echo "effective_branch=${{ env.EFFECTIVE_BRANCH }}"
+          echo "github_ref=${{ github.ref }}"
+          echo "github_ref_name=${{ github.ref_name }}"
+          echo "git_branch=$(git branch --show-current)"
+
+
       # ---------------------------------------------------
       # NODE
       # ---------------------------------------------------
