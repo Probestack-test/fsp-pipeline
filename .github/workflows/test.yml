@@ -63,79 +63,117 @@ on:
       APP_PRIVATE_KEY:
         required: true
 
+
 # =========================================================
 # PERMISSIONS
 # =========================================================
 
 permissions:
   contents: read
+
+
 # =========================================================
 # GLOBAL ENV
 # =========================================================
+
 env:
   RESOURCE_TYPE: ${{ inputs.resourcetype }}
   BUNDLE_DIR: ${{ inputs.resourcetype == 'apis' && 'apiproxy' || 'sharedflowbundle' }}
+
+  # CHANGE 1:
+  # PR merge -> target/base branch (release)
+  # Normal push -> caller supplied/current branch
   EFFECTIVE_BRANCH: ${{ github.event_name == 'pull_request' && github.base_ref || inputs.branch_name || github.ref_name }}
+
+
 # =========================================================
 # JOB
 # =========================================================
+
 jobs:
   build-lint-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
+
       # ===================================================
       # SETUP
       # ===================================================
+
       - name: Start group Setup
         run: echo "::group::Setup"
+
+
       # ---------------------------------------------------
       # CHECKOUT
       # ---------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+        # CHANGE 2:
+        # PR merge to release -> checkout release
         with:
           ref: ${{ env.EFFECTIVE_BRANCH }}
+
+
       # ---------------------------------------------------
       # NODE
       # ---------------------------------------------------
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
+
+
       # ---------------------------------------------------
       # TOOLS
       # ---------------------------------------------------
+
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq unzip
+
+
       # ---------------------------------------------------
       # GITHUB AUTH
       # ---------------------------------------------------
+
       - name: Force GitHub auth
         run: |
           git config --global \
             url."https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/".insteadOf \
             "https://github.com/"
 
+
       - name: End group Setup
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # VALIDATION
       # ===================================================
+
       - name: Start group Validation
         run: echo "::group::Validation"
+
 
       - name: Validate Resource Type
         run: |
           set -euo pipefail
+
           if [[ "${{ inputs.resourcetype }}" != "apis" &&
                 "${{ inputs.resourcetype }}" != "sharedflows" ]]; then
+
             echo "Invalid resourcetype: ${{ inputs.resourcetype }}"
             exit 1
           fi
+
+
       # ---------------------------------------------------
       # VALIDATE RELEASE PROPERTIES
       # ---------------------------------------------------
@@ -143,37 +181,52 @@ jobs:
       - name: Validate release.properties
         run: |
           set -euo pipefail
+
           if [ ! -f release.properties ]; then
             echo "ERROR: release.properties not found"
             exit 1
           fi
+
           if ! grep -q '^version=' release.properties; then
             echo "ERROR: version property not found"
             exit 1
           fi
+
           BASE_VERSION=$(grep '^version=' release.properties | cut -d'=' -f2)
+
           echo "Base version: $BASE_VERSION"
+
 
       - name: End group Validation
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # FORGESPHERE CONFIGURATION
       # ===================================================
+
       - name: Start group ForgeSphere Configuration
         run: echo "::group::ForgeSphere Configuration"
+
 
       - name: Load ForgeSphere CI/CD Configuration
         id: config
         shell: bash
+
         env:
           CICD_CONFIG_URL: ${{ inputs.cicd_config_url }}
           CICD_CONFIG_ID: ${{ inputs.cicd_config_id }}
+
         run: |
           set -euo pipefail
+
           CONFIG_URL="${CICD_CONFIG_URL%/}/${CICD_CONFIG_ID}/all?filtered=true"
+
           echo "Fetching ForgeSphere CI/CD configuration... ${CONFIG_URL}"
+
           APIGEE_PROXY="${APIGEE_PROXY:-}"
+
           HTTP_STATUS=$(curl \
             --silent \
             --show-error \
@@ -187,11 +240,12 @@ jobs:
             echo "HTTP status: $HTTP_STATUS"
             exit 1
           fi
+
           if [ ! -s cicd-config.json ]; then
             echo "ERROR: Empty CI/CD configuration"
             exit 1
           fi
-        
+
           jq empty cicd-config.json
 
           # Extract only APIGEE_PROXY configuration
@@ -199,11 +253,14 @@ jobs:
             strategies: .strategies,
             pipelineConfig: .pipelineConfigs.APIGEE_PROXY
           }' cicd-config.json > apigee-config.json
-                    
+
           echo "APIGEE_PROXY: $APIGEE_PROXY"
+
+
           # ------------------------------------------------
           # BRANCH STRATEGY
           # ------------------------------------------------
+
           MERGE_BRANCH=$(jq -r '
             .strategies[]
             | .branches[]
@@ -211,59 +268,86 @@ jobs:
             | .name
           ' apigee-config.json | head -n 1)
 
-           MERGE_TAG=$(jq -r '
+
+          MERGE_TAG=$(jq -r '
             .strategies[]
             | .branches[]
             | select(.tag == "merge")
             | .tag
           ' apigee-config.json | head -n 1)
 
+
           if [ -z "$MERGE_BRANCH" ] || [ "$MERGE_BRANCH" = "null" ]; then
             echo "ERROR: merge branch not configured"
             exit 1
           fi
-          
+
+
           # ------------------------------------------------
           # SONAR CONFIGURATION
           # ------------------------------------------------
+
           SONAR_HOST_URL=$(jq -r '.pipelineConfig.securityToolConfigs.sonarscanner.SONAR_HOST_URL' apigee-config.json)
           SONAR_TOKEN=$(jq -r '.pipelineConfig.securityToolConfigs.sonarscanner.SONAR_TOKEN' apigee-config.json)
           SONAR_PROJECT_KEY=${{ inputs.deploy_proxy }}
+
+
           # ------------------------------------------------
           # VALIDATE SONAR
           # ------------------------------------------------
+
           if [ -z "$SONAR_HOST_URL" ] ||
              [ "$SONAR_HOST_URL" = "null" ]; then
+
             echo "ERROR: SONAR_HOST_URL not configured"
             exit 1
           fi
+
+
           if [ -z "$SONAR_TOKEN" ] ||
              [ "$SONAR_TOKEN" = "null" ]; then
+
             echo "ERROR: SONAR_TOKEN not configured"
             exit 1
           fi
+
+
           if [ -z "$SONAR_PROJECT_KEY" ] ||
              [ "$SONAR_PROJECT_KEY" = "null" ]; then
+
             echo "ERROR: SONAR_PROJECT_KEY not configured"
             exit 1
           fi
+
+
           # ------------------------------------------------
           # NEXUS CONFIGURATION
           # ------------------------------------------------
+
           NEXUS_URL=$(jq -r '.pipelineConfig.artifactToolConfigs.nexus.NEXUS_URL' apigee-config.json)
+
           NEXUS_USERNAME=$(jq -r '.pipelineConfig.artifactToolConfigs.nexus.NEXUS_USERNAME' apigee-config.json)
+
           NEXUS_PASSWORD=$(jq -r '.pipelineConfig.artifactToolConfigs.nexus.NEXUS_PASSWORD' apigee-config.json)
+
           NEXUS_REPOSITORY=$(jq -r '.pipelineConfig.artifactToolConfigs.nexus.NEXUS_REPOSITORY' apigee-config.json)
+
+
           # ------------------------------------------------
           # MASK SECRETS
           # ------------------------------------------------
+
           echo "::add-mask::$SONAR_TOKEN"
+
           if [ -n "$NEXUS_PASSWORD" ]; then
             echo "::add-mask::$NEXUS_PASSWORD"
           fi
+
+
           # ------------------------------------------------
           # OUTPUTS
           # ------------------------------------------------
+
           {
             echo "merge_branch=$MERGE_BRANCH"
             echo "merge_tag=$MERGE_TAG"
@@ -275,6 +359,8 @@ jobs:
             echo "nexus_password=$NEXUS_PASSWORD"
             echo "nexus_repository=$NEXUS_REPOSITORY"
           } >> "$GITHUB_OUTPUT"
+
+
           echo "========================================"
           echo "ForgeSphere configuration loaded"
           echo "Merge branch : $MERGE_BRANCH"
@@ -288,6 +374,8 @@ jobs:
       - name: End group ForgeSphere Configuration
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # OPTIONAL GITHUB APP TOKEN
       # ===================================================
@@ -306,16 +394,21 @@ jobs:
         shell: bash
         run: |
           TOKEN="${{ steps.app-token.outputs.token }}"
+
           if [ -n "$TOKEN" ]; then
             echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
           else
             echo "token=${{ secrets.GH_TOKEN }}" >> "$GITHUB_OUTPUT"
           fi
+
+
       # ===================================================
       # LINT
       # ===================================================
+
       - name: Start group Lint
         run: echo "::group::Lint"
+
 
       - name: Checkout lint rules
         continue-on-error: true
@@ -326,120 +419,172 @@ jobs:
           path: apigee-linting-custom
           token: ${{ steps.token-select.outputs.token }}
 
+
       - name: Apigee Lint
         continue-on-error: true
         run: |
           if [ -d "./apigee-linting-custom" ]; then
+
             npx apigeelint \
               -s "$BUNDLE_DIR" \
               -x ./apigee-linting-custom/rules \
               -f table.js || true
+
           else
             echo "Skipping Apigee lint"
           fi
+
+
       - name: JS Lint
         continue-on-error: true
         run: |
           npx jslint "$BUNDLE_DIR"/**/*.js || true
 
+
       # ===================================================
       # SONAR
       # ===================================================
+
       - name: Sonar Scan
         continue-on-error: true
+
         env:
           SONAR_HOST_URL: ${{ steps.config.outputs.sonar_host_url }}
           SONAR_TOKEN: ${{ steps.config.outputs.sonar_token }}
           SONAR_PROJECT_KEY: ${{ steps.config.outputs.sonar_project_key }}
+
         run: |
           set -euo pipefail
-          echo "Running SonarQube scan"          npx sonarqube-scanner \
+
+          echo "Running SonarQube scan"
+
+          npx sonarqube-scanner \
             -Dsonar.host.url="$SONAR_HOST_URL" \
             -Dsonar.token="$SONAR_TOKEN" \
             -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
             -Dsonar.sources="$BUNDLE_DIR"
 
+
       - name: End group Lint
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # VERSION
       # ===================================================
+
       - name: Calculate Version
         id: version
         shell: bash
+
         env:
           INPUT_VERSION: ${{ inputs.version }}
+
         run: |
           set -euo pipefail
+
           if [ -n "$INPUT_VERSION" ]; then
+
             VERSION="$INPUT_VERSION"
+
           else
+
             BASE_VERSION=$(grep '^version=' release.properties | cut -d'=' -f2)
+
             SHORT_SHA=$(git rev-parse --short HEAD)
+
             VERSION="${BASE_VERSION}-${SHORT_SHA}"
+
           fi
+
           echo "Version: $VERSION"
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+
       # ===================================================
       # PACKAGE
       # ===================================================
+
       - name: Start group Package
         run: echo "::group::Package"
+
 
       - name: Package Proxy
         shell: bash
         run: |
           set -euo pipefail
+
           if [ "${{ inputs.resourcetype }}" = "apis" ]; then
             ZIP_FILE="proxy.zip"
           else
             ZIP_FILE="sharedflowbundle.zip"
           fi
+
           echo "RESOURCE_TYPE=$RESOURCE_TYPE"
           echo "BUNDLE_DIR=$BUNDLE_DIR"
           echo "ZIP_FILE=$ZIP_FILE"
+
           test -d "$BUNDLE_DIR"
+
           zip -r "$ZIP_FILE" "$BUNDLE_DIR"
+
           ARTIFACT_NAME="${{ inputs.deploy_proxy }}.zip"
+
           cp "$ZIP_FILE" "$ARTIFACT_NAME"
+
           echo "========================================"
           echo "ZIP CREATED"
           echo "Artifact: $ARTIFACT_NAME"
           echo "Version : ${{ steps.version.outputs.version }}"
           echo "========================================"
+
           ls -lh "$ZIP_FILE" "$ARTIFACT_NAME"
+
+
       - name: End group Package
         if: always()
         run: echo "::endgroup::"
 
+
       # ===================================================
       # NEXUS PUSH
       # ===================================================
+
       - name: Start group Nexus Push
         run: echo "::group::Nexus Push"
+
 
       - name: Push Package to Nexus
         if: steps.config.outputs.nexus_url != '' && steps.config.outputs.merge_branch == inputs.branch_name
         shell: bash
+
         env:
           NEXUS_URL: ${{ steps.config.outputs.nexus_url }}
           NEXUS_REPOSITORY: ${{ steps.config.outputs.nexus_repository }}
           NEXUS_USERNAME: ${{ steps.config.outputs.nexus_username }}
           NEXUS_PASSWORD: ${{ steps.config.outputs.nexus_password }}
+
         run: |
           set -euo pipefail
+
           ARTIFACT_NAME="${{ inputs.deploy_proxy }}.zip"
+
           VERSION="${{ steps.version.outputs.version }}"
+
           if [ ! -f "$ARTIFACT_NAME" ]; then
             echo "ERROR: Package not found: $ARTIFACT_NAME"
             exit 1
           fi
+
           if [ -z "$NEXUS_REPOSITORY" ]; then
             echo "ERROR: Nexus repository not configured"
             exit 1
           fi
+
           UPLOAD_URL="${NEXUS_URL%/}/repository/${NEXUS_REPOSITORY}/${{ inputs.deploy_proxy }}/${VERSION}/${ARTIFACT_NAME}"
+
           echo "========================================"
           echo "NEXUS UPLOAD"
           echo "========================================"
@@ -448,6 +593,7 @@ jobs:
           echo "Artifact   : $ARTIFACT_NAME"
           echo "Version    : $VERSION"
           echo "========================================"
+
           curl \
             --fail \
             --show-error \
@@ -455,7 +601,9 @@ jobs:
             --user "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
             --upload-file "$ARTIFACT_NAME" \
             "$UPLOAD_URL"
+
           echo "Nexus upload successful"
+
 
       - name: Nexus not configured
         if: steps.config.outputs.nexus_url == ''
@@ -463,19 +611,25 @@ jobs:
           echo "Nexus configuration not available from ForgeSphere"
           echo "Skipping Nexus upload"
 
+
       - name: End group Nexus Push
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # TOKEN SERVICE AUTH
       # ===================================================
+
       - name: Start group Token auth
         run: echo "::group::Token auth"
+
 
       - name: Get Access Token
         id: token
         run: |
           set -euo pipefail
+
           RESPONSE=$(curl \
             -s \
             -w "\nHTTP_STATUS:%{http_code}\n" \
@@ -496,32 +650,44 @@ jobs:
 
           if [ -z "$ACCESS_TOKEN" ] ||
              [ "$ACCESS_TOKEN" = "null" ]; then
+
             echo "Invalid token"
             exit 1
           fi
+
           echo "::add-mask::$ACCESS_TOKEN"
+
           echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
-          
+
+
       - name: End group Token auth
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # IMPORT
       # ===================================================
+
       - name: Start group Import
         run: echo "::group::Import"
+
 
       - name: Import Proxy
         shell: bash
         run: |
           set -euo pipefail
+
           if [ "${{ inputs.resourcetype }}" = "apis" ]; then
             ZIP_FILE="proxy.zip"
           else
             ZIP_FILE="sharedflowbundle.zip"
           fi
+
           URL="https://apigee.googleapis.com/v1/organizations/${{ inputs.apigee_org }}/${{ inputs.resourcetype }}?action=import&name=${{ inputs.deploy_proxy }}"
+
           TOKEN="${{ steps.token.outputs.access_token }}"
+
           RESPONSE=$(curl \
             --silent \
             --show-error \
@@ -534,19 +700,25 @@ jobs:
           STATUS=$(echo "$RESPONSE" |
             grep HTTP_STATUS |
             cut -d':' -f2)
+
           if [ "$STATUS" -ne 200 ]; then
             echo "Import failed"
             echo "$RESPONSE"
             exit 1
           fi
+
           echo "Import successful"
+
 
       - name: End group Import
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # GET REVISION
       # ===================================================
+
       - name: Start group Revision
         run: echo "::group::Revision"
 
@@ -555,6 +727,7 @@ jobs:
         id: revision
         run: |
           set -euo pipefail
+
           REV=$(curl \
             --silent \
             --show-error \
@@ -566,13 +739,19 @@ jobs:
             echo "Unable to determine revision"
             exit 1
           fi
+
           echo "revision=$REV" >> "$GITHUB_OUTPUT"
+
+
       - name: End group Revision
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # DEPLOY
       # ===================================================
+
       - name: Start group Deployment
         run: echo "::group::Deployment"
 
@@ -581,10 +760,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           URL="https://apigee.googleapis.com/v1/organizations/${{ inputs.apigee_org }}/environments/${{ inputs.apigee_env }}/${{ inputs.resourcetype }}/${{ inputs.deploy_proxy }}/revisions/${{ steps.revision.outputs.revision }}/deployments"
 
           TOKEN="${{ steps.token.outputs.access_token }}"
+
           BODY='{ "override": true }'
+
           RESPONSE=$(curl \
             --silent \
             --show-error \
@@ -604,13 +786,19 @@ jobs:
             echo "$RESPONSE"
             exit 1
           fi
+
           echo "Deployment successful"
+
+
       - name: End group Deployment
         if: always()
         run: echo "::endgroup::"
+
+
       # ===================================================
       # VERIFY
       # ===================================================
+
       - name: Start group Verify
         run: echo "::group::Verify"
 
@@ -618,6 +806,7 @@ jobs:
       - name: Verify Deployment
         run: |
           set -euo pipefail
+
           STATUS=$(curl \
             --silent \
             --output /dev/null \
@@ -629,7 +818,10 @@ jobs:
             echo "Proxy does not exist"
             exit 1
           fi
+
           echo "Deployment verified successfully"
+
+
       - name: End group Verify
         if: always()
         run: echo "::endgroup::"
@@ -642,7 +834,5 @@ jobs:
       - name: Cleanup CI/CD configuration
         if: always()
         run: |
-
           rm -f apigee-config.json
-
           echo "Temporary configuration removed"
