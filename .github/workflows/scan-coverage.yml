@@ -1,0 +1,49 @@
+name: Scan bundle tests and coverage
+run-name: Coverage for ${{ inputs.scan_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      scan_id:
+        required: true
+        type: string
+      execution_id:
+        required: true
+        type: string
+      bundle_url:
+        required: true
+        type: string
+      artifact_sha256:
+        required: true
+        type: string
+      execution_checks:
+        description: "Comma-separated ordered checks: COMPILE,TEST,COVERAGE"
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test in isolated container
+        env:
+          SCAN_ID: ${{ inputs.scan_id }}
+          EXECUTION_ID: ${{ inputs.execution_id }}
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+          ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+          EXECUTION_CHECKS: ${{ inputs.execution_checks }}
+          SCAN_API_URL: ${{ vars.SCAN_API_URL }}
+          SCAN_RUNNER_TOKEN: ${{ secrets.SCAN_RUNNER_TOKEN }}
+        run: python3 scripts/scan_coverage.py
+      - name: Store actual runner reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-coverage-${{ inputs.scan_id }}
+          path: scan-output/
+          retention-days: 7
+          if-no-files-found: warn
