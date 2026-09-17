@@ -53,7 +53,14 @@ def plan(project,checks):
         commands=[]
         if 'COMPILE' in checks:commands.append(('BUILD','mvn -B clean -DskipTests compile'))
         if 'TEST' in checks:
-            command='mvn -B test' if 'COVERAGE' not in checks else 'mvn -B org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.12:report'
+            if 'COVERAGE' not in checks: command='mvn -B clean test'
+            else:
+                pom=(project/'pom.xml').read_text(errors='replace')
+                # Generated projects may already configure JaCoCo. Attaching a second agent can
+                # corrupt the argLine, so use the project's plugin when present.
+                command=('mvn -B clean test org.jacoco:jacoco-maven-plugin:report'
+                         if 'jacoco-maven-plugin' in pom else
+                         'mvn -B clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.12:report')
             commands.append(('TEST',command))
         return 'maven:3.9.9-eclipse-temurin-17',commands
     if (project/'package.json').exists():
@@ -105,7 +112,14 @@ def main():
             try:
                 with (output/(stage.lower()+'.log')).open('wb') as log:result=subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=1200)
             finally:subprocess.run(['docker','rm','-f',name],capture_output=True)
-            if result.returncode!=0:event('ERROR',failedStage=stage,exitCode=result.returncode,reason=stage+' execution failed');return
+            if result.returncode!=0:
+                log_path=output/(stage.lower()+'.log')
+                tail=log_path.read_text(errors='replace')[-4000:] if log_path.exists() else ''
+                event('ERROR',failedStage=stage,exitCode=result.returncode,
+                      reason=stage+' execution failed',logTail=tail)
+                # Preserve the callback, but also make the GitHub job truthfully fail. Artifact
+                # upload still runs because the workflow step uses `if: always()`.
+                raise SystemExit(result.returncode)
         for report in project.rglob('*'):
             if report.name in ('jacoco.xml','coverage.xml','lcov.info','test-results.xml') or report.name.startswith('TEST-') and report.suffix=='.xml':
                 if report.is_symlink() or not report.resolve().is_relative_to(project) or not report.is_file() or report.stat().st_size>20*1024*1024:continue

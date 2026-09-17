@@ -18,6 +18,15 @@ class CoverageReports(unittest.TestCase):
             self.assertEqual(['BUILD'], [stage for stage, _ in commands])
             self.assertNotIn(' test', commands[0][1])
 
+    def test_java_coverage_cleans_stale_output_and_does_not_duplicate_configured_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'pom.xml').write_text('<artifactId>jacoco-maven-plugin</artifactId>')
+            _, commands = scanner.plan(root, ['TEST', 'COVERAGE'])
+            command = commands[0][1]
+            self.assertIn(' clean test ', command)
+            self.assertNotIn('prepare-agent', command)
+
     def test_node_test_without_coverage_does_not_request_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
