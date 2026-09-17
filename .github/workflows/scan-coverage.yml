@@ -9,6 +9,9 @@ on:
       execution_id:
         required: true
         type: string
+      organization_id:
+        required: true
+        type: string
       bundle_url:
         required: true
         type: string
@@ -29,6 +32,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Obtain short-lived Forge service token
+        env:
+          TOKEN_ISSUER_URL: ${{ vars.TOKEN_ISSUER_URL }}
+          TOKEN_ISSUER_CLIENT_ID: ${{ vars.TOKEN_ISSUER_CLIENT_ID }}
+          TOKEN_ISSUER_CLIENT_SECRET: ${{ secrets.TOKEN_ISSUER_CLIENT_SECRET }}
+          TOKEN_ISSUER_AUDIENCE: ${{ vars.TOKEN_ISSUER_AUDIENCE }}
+          TOKEN_ISSUER_SCOPE: ${{ vars.TOKEN_ISSUER_SCOPE }}
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error \
+            --user "${TOKEN_ISSUER_CLIENT_ID}:${TOKEN_ISSUER_CLIENT_SECRET}" \
+            --data-urlencode 'grant_type=client_credentials' \
+            --data-urlencode "audience=${TOKEN_ISSUER_AUDIENCE}" \
+            --data-urlencode "organization_id=${ORGANIZATION_ID}" \
+            --data-urlencode "scope=${TOKEN_ISSUER_SCOPE}" \
+            "${TOKEN_ISSUER_URL}")"
+          token="$(jq -er '.access_token' <<<"${response}")"
+          echo "::add-mask::${token}"
+          echo "SCAN_RUNNER_TOKEN=${token}" >> "${GITHUB_ENV}"
       - name: Build and test in isolated container
         env:
           SCAN_ID: ${{ inputs.scan_id }}
@@ -37,7 +60,6 @@ jobs:
           ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
           EXECUTION_CHECKS: ${{ inputs.execution_checks }}
           SCAN_API_URL: ${{ vars.SCAN_API_URL }}
-          SCAN_RUNNER_TOKEN: ${{ secrets.SCAN_RUNNER_TOKEN }}
         run: python3 scripts/scan_coverage.py
       - name: Store actual runner reports and logs
         if: always()
