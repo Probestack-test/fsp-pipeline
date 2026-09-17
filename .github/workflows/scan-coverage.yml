@@ -61,6 +61,11 @@ jobs:
           EXECUTION_CHECKS: ${{ inputs.execution_checks }}
           SCAN_API_URL: ${{ vars.SCAN_API_URL }}
         run: python3 scripts/scan_coverage.py
+      - name: Remove runner containers after cancellation or failure
+        if: always()
+        env:
+          EXECUTION_ID: ${{ inputs.execution_id }}
+        run: docker rm -f "scan-${EXECUTION_ID}-0" "scan-${EXECUTION_ID}-1" 2>/dev/null || true
       - name: Store actual runner reports and logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -26,7 +26,7 @@ on:
 
       node_version:
         required: false
-        default: '18'
+        default: '22'
         type: string
 
       branch_name:
@@ -116,6 +116,7 @@ jobs:
         # PR merge to release -> checkout release
         with:
           ref: ${{ env.EFFECTIVE_BRANCH }}
+          persist-credentials: false
 
 
       - name: Verify checkout branch
@@ -175,15 +176,27 @@ jobs:
 
 
       - name: Validate Resource Type
+        env:
+          INPUT_RESOURCE_TYPE: ${{ inputs.resourcetype }}
+          INPUT_APIGEE_ORG: ${{ inputs.apigee_org }}
+          INPUT_APIGEE_ENV: ${{ inputs.apigee_env }}
+          INPUT_DEPLOY_PROXY: ${{ inputs.deploy_proxy }}
         run: |
           set -euo pipefail
 
-          if [[ "${{ inputs.resourcetype }}" != "apis" &&
-                "${{ inputs.resourcetype }}" != "sharedflows" ]]; then
+          if [[ "$INPUT_RESOURCE_TYPE" != "apis" &&
+                "$INPUT_RESOURCE_TYPE" != "sharedflows" ]]; then
 
-            echo "Invalid resourcetype: ${{ inputs.resourcetype }}"
+            echo "Invalid resourcetype: $INPUT_RESOURCE_TYPE"
             exit 1
           fi
+
+          for value in "$INPUT_APIGEE_ORG" "$INPUT_APIGEE_ENV" "$INPUT_DEPLOY_PROXY"; do
+            if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Invalid Apigee identifier"
+              exit 1
+            fi
+          done
 
 
       # ---------------------------------------------------
@@ -351,8 +364,22 @@ jobs:
 
           echo "::add-mask::$SONAR_TOKEN"
 
-          if [ -n "$NEXUS_PASSWORD" ]; then
+          if [ -n "$NEXUS_PASSWORD" ] && [ "$NEXUS_PASSWORD" != "null" ]; then
             echo "::add-mask::$NEXUS_PASSWORD"
+          fi
+
+          if [ "$NEXUS_URL" != "null" ] && [ -n "$NEXUS_URL" ]; then
+            for value in "$NEXUS_USERNAME" "$NEXUS_PASSWORD" "$NEXUS_REPOSITORY"; do
+              if [ -z "$value" ] || [ "$value" = "null" ]; then
+                echo "ERROR: Nexus configuration is incomplete"
+                exit 1
+              fi
+            done
+          else
+            NEXUS_URL=""
+            NEXUS_USERNAME=""
+            NEXUS_PASSWORD=""
+            NEXUS_REPOSITORY=""
           fi
 
 
@@ -569,7 +596,7 @@ jobs:
 
 
       - name: Push Package to Nexus
-        if: steps.config.outputs.nexus_url != '' && steps.config.outputs.merge_branch == inputs.branch_name
+        if: steps.config.outputs.nexus_url != '' && steps.config.outputs.merge_branch == env.EFFECTIVE_BRANCH
         shell: bash
 
         env:
@@ -846,5 +873,5 @@ jobs:
       - name: Cleanup CI/CD configuration
         if: always()
         run: |
-          rm -f apigee-config.json
+          rm -f apigee-config.json cicd-config.json
           echo "Temporary configuration removed"

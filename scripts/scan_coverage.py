@@ -1,11 +1,12 @@
 """Run selected build/test checks; bundle code stays in a constrained container."""
 import hashlib, json, os, pathlib, re, shutil, subprocess, tempfile, urllib.request, zipfile
 import xml.etree.ElementTree as ET
-MAX_ZIP, MAX_EXPANDED, sequence = 100*1024*1024, 500*1024*1024, 0
+MAX_ZIP, MAX_EXPANDED, sequence, terminal_event_sent = 100*1024*1024, 500*1024*1024, 0, False
 
 def event(stage, **details):
-    global sequence
+    global sequence, terminal_event_sent
     sequence += 1
+    if stage in ('ERROR','COMPLETE'):terminal_event_sent=True
     body = dict(executionId=os.environ['EXECUTION_ID'], artifactSha256=os.environ['ARTIFACT_SHA256'], sequence=sequence, stage=stage, **details)
     endpoint = os.environ['SCAN_API_URL'].rstrip('/')+'/v2/scans/'+os.environ['SCAN_ID']+'/execution-events'
     if not endpoint.startswith('https://'): raise ValueError('SCAN_API_URL must use HTTPS')
@@ -62,6 +63,57 @@ def collect_reports(project, output):
             if report.is_symlink() or not report.resolve().is_relative_to(project) or not report.is_file() or report.stat().st_size>20*1024*1024:continue
             destination=output/report.relative_to(project);destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(report,destination)
 
+def major_version(value, supported, label, default):
+    if not value:return default
+    match=re.search(r'(?<!\d)(\d+)(?:\.\d+)*',str(value))
+    if not match:raise ValueError('Cannot determine '+label+' version from '+str(value))
+    version=int(match.group(1));version=8 if version==1 and re.search(r'1\.8',str(value)) else version
+    if version not in supported:raise ValueError('Unsupported '+label+' version '+str(version)+'; supported: '+','.join(map(str,supported)))
+    return version
+
+def maven_java_version(project):
+    path=project/'.java-version'
+    if path.exists():return major_version(path.read_text().strip(),(8,11,17,21,25),'Java',17)
+    sdkman=project/'.sdkmanrc'
+    if sdkman.exists():
+        match=re.search(r'^java\s*=\s*([^\s]+)',sdkman.read_text(errors='replace'),re.M)
+        if match:return major_version(match.group(1),(8,11,17,21,25),'Java',17)
+    pom=(project/'pom.xml').read_text(errors='replace')
+    values={name:re.search(r'<'+re.escape(name)+r'>\s*([^<]+)\s*</'+re.escape(name)+r'>',pom) for name in ('maven.compiler.release','java.version','maven.compiler.target','maven.compiler.source')}
+    for name in values:
+        match=values[name]
+        if match:
+            value=match.group(1).strip()
+            property_ref=re.fullmatch(r'\$\{([^}]+)\}',value)
+            if property_ref:
+                resolved=re.search(r'<'+re.escape(property_ref.group(1))+r'>\s*([^<]+)\s*</'+re.escape(property_ref.group(1))+r'>',pom)
+                value=resolved.group(1).strip() if resolved else value
+            return major_version(value,(8,11,17,21,25),'Java',17)
+    return 17
+
+def node_version(project):
+    for version_file in ('.nvmrc','.node-version'):
+        path=project/version_file
+        if path.exists():return major_version(path.read_text().strip(),(18,20,22,24),'Node',22)
+    package=json.loads((project/'package.json').read_text())
+    return major_version(package.get('engines',{}).get('node'),(18,20,22,24),'Node',22)
+
+def python_version(project):
+    value=None
+    pyproject=project/'pyproject.toml'
+    if pyproject.exists():
+        match=re.search(r'requires-python\s*=\s*["\']([^"\']+)',pyproject.read_text(errors='replace'))
+        if match:value=match.group(1)
+    version=major_version(value,(3,),'Python',3)
+    minor_match=re.search(r'3\.(\d+)',value or '')
+    minor=int(minor_match.group(1)) if minor_match else 12
+    if minor not in (9,10,11,12,13):raise ValueError('Unsupported Python version 3.'+str(minor))
+    return str(version)+'.'+str(minor)
+
+def container_identity_args():
+    uid=getattr(os,'getuid',lambda:1000)();gid=getattr(os,'getgid',lambda:1000)()
+    return ['--user',str(uid)+':'+str(gid),'--env','HOME=/tmp','--env','MAVEN_CONFIG=/tmp/.m2']
+
 def plan(project,checks):
     if (project/'pom.xml').exists():
         commands=[]
@@ -76,7 +128,7 @@ def plan(project,checks):
                          if 'jacoco-maven-plugin' in pom else
                          'mvn -B clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.12:report')
             commands.append(('TEST',command))
-        return 'maven:3.9.9-eclipse-temurin-17',commands
+        return 'maven:3.9.9-eclipse-temurin-'+str(maven_java_version(project)),commands
     if (project/'package.json').exists():
         scripts=json.loads((project/'package.json').read_text()).get('scripts',{});commands=[];install='npm ci --ignore-scripts'
         if 'COMPILE' in checks:
@@ -86,14 +138,14 @@ def plan(project,checks):
         if 'TEST' in checks:
             if not scripts.get('test'):raise ValueError('No existing Node test script')
             commands.append(('TEST',install+' && '+('npm test -- --coverage' if 'COVERAGE' in checks else 'npm test')))
-        return 'node:22-bookworm-slim',commands
+        return 'node:'+str(node_version(project))+'-bookworm-slim',commands
     install='if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi; if [ -f pyproject.toml ]; then python -m pip install .; fi';commands=[]
     if 'COMPILE' in checks:commands.append(('BUILD',install+'; python -m compileall -q .'));install='true'
     if 'TEST' in checks:
         if not list(project.rglob('test_*.py')) and not list(project.rglob('*_test.py')):raise ValueError('No existing Python tests')
         packages='python -m pip install pytest pytest-cov' if 'COVERAGE' in checks else 'python -m pip install pytest';report=' --cov=. --cov-report=xml:coverage.xml' if 'COVERAGE' in checks else ''
         commands.append(('TEST',install+'; '+packages+'; python -m pytest --junitxml=test-results.xml'+report))
-    return 'python:3.12-slim',commands
+    return 'python:'+python_version(project)+'-slim',commands
 
 def main():
     output=pathlib.Path('scan-output').resolve();output.mkdir(exist_ok=True)
@@ -125,7 +177,7 @@ def main():
         make_workspace_writable(workspace)
         for index,(stage,command) in enumerate(commands):
             event(stage,runner=image,reason='Executing selected '+stage.lower()+' check');name='scan-'+os.environ['EXECUTION_ID']+'-'+str(index)
-            args=['docker','run','--name',name,'--user','0:0','--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--workdir=/workspace',image,'sh','-ec',command]
+            args=['docker','run','--name',name,*container_identity_args(),'--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--workdir=/workspace',image,'sh','-ec',command]
             try:
                 with (output/(stage.lower()+'.log')).open('wb') as log:result=subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=1200)
             finally:subprocess.run(['docker','rm','-f',name],capture_output=True)
@@ -148,4 +200,5 @@ def main():
 if __name__=='__main__':
     try:main()
     except Exception as error:
-        event('ERROR',reason=type(error).__name__+': execution did not complete');raise
+        if not terminal_event_sent:event('ERROR',reason=type(error).__name__+': execution did not complete')
+        raise

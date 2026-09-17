@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import tempfile
 import unittest
@@ -10,6 +11,41 @@ spec.loader.exec_module(scanner)
 
 
 class CoverageReports(unittest.TestCase):
+    def test_maven_image_matches_bundle_java_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'pom.xml').write_text('<project><properties><java.version>21</java.version></properties></project>')
+            image, _ = scanner.plan(root, ['TEST'])
+            self.assertEqual('maven:3.9.9-eclipse-temurin-21', image)
+
+    def test_maven_image_defaults_to_java_17_when_manifest_is_unspecified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'pom.xml').write_text('<project/>')
+            image, _ = scanner.plan(root, ['TEST'])
+            self.assertEqual('maven:3.9.9-eclipse-temurin-17', image)
+
+    def test_node_image_matches_package_engine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'package.json').write_text('{"engines":{"node":">=20"},"scripts":{"test":"vitest"}}')
+            image, _ = scanner.plan(root, ['TEST'])
+            self.assertEqual('node:20-bookworm-slim', image)
+
+    def test_python_image_matches_pyproject_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'pyproject.toml').write_text('[project]\nrequires-python = ">=3.11"\n')
+            (root / 'test_app.py').write_text('def test_ok(): assert True\n')
+            image, _ = scanner.plan(root, ['TEST'])
+            self.assertEqual('python:3.11-slim', image)
+
+    def test_container_uses_runner_identity_instead_of_root(self):
+        args = scanner.container_identity_args()
+        uid = getattr(os, 'getuid', lambda: 1000)()
+        gid = getattr(os, 'getgid', lambda: 1000)()
+        self.assertEqual(str(uid) + ':' + str(gid), args[1])
+
     def test_java_compile_only_plan_does_not_run_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
