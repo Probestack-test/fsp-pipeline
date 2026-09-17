@@ -114,19 +114,32 @@ def container_identity_args():
     uid=getattr(os,'getuid',lambda:1000)();gid=getattr(os,'getgid',lambda:1000)()
     return ['--user',str(uid)+':'+str(gid),'--env','HOME=/tmp','--env','MAVEN_CONFIG=/tmp/.m2']
 
-def plan(project,checks):
+def jacoco_agent_configured(project):
+    """True only when an active build plugin execution attaches JaCoCo to tests."""
+    try:
+        root=ET.parse(project/'pom.xml').getroot()
+        namespace=root.tag.partition('}')[0]+'}' if root.tag.startswith('{') else ''
+        plugins=root.find(namespace+'build')
+        plugins=None if plugins is None else plugins.find(namespace+'plugins')
+        if plugins is None:return False
+        for plugin in plugins.findall(namespace+'plugin'):
+            artifact=plugin.find(namespace+'artifactId')
+            if artifact is None or (artifact.text or '').strip()!='jacoco-maven-plugin':continue
+            return any((goal.text or '').strip() in ('prepare-agent','prepare-agent-integration')
+                       for goal in plugin.findall('.//'+namespace+'goal'))
+    except ET.ParseError:return False
+    return False
+
+def plan(project,checks,target_type=''):
     if (project/'pom.xml').exists():
         commands=[]
         if 'COMPILE' in checks:commands.append(('BUILD','mvn -B clean -DskipTests compile'))
         if 'TEST' in checks:
             if 'COVERAGE' not in checks: command='mvn -B clean test'
             else:
-                pom=(project/'pom.xml').read_text(errors='replace')
-                # Generated projects may already configure JaCoCo. Attaching a second agent can
-                # corrupt the argLine, so use the project's plugin when present.
-                command=('mvn -B clean test org.jacoco:jacoco-maven-plugin:report'
-                         if 'jacoco-maven-plugin' in pom else
-                         'mvn -B clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.12:report')
+                report='org.jacoco:jacoco-maven-plugin:0.8.12:report'
+                command=('mvn -B clean test '+report if jacoco_agent_configured(project) else
+                         'mvn -B clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test '+report)
             commands.append(('TEST',command))
         return 'maven:3.9.9-eclipse-temurin-'+str(maven_java_version(project)),commands
     if (project/'package.json').exists():
@@ -147,6 +160,15 @@ def plan(project,checks):
         commands.append(('TEST',install+'; '+packages+'; python -m pytest --junitxml=test-results.xml'+report))
     return 'python:'+python_version(project)+'-slim',commands
 
+def config_plan(project,checks,target_type):
+    kind=target_type.upper()
+    aliases={'APIGEE_PROXY':'APIGEE','APIGEE_SHARED_FLOW':'APIGEE','API_PROXY':'APIGEE','SHARED_FLOW':'APIGEE','KONG_GATEWAY_SERVICE':'KONG','MCP_SERVER':'MCP'}
+    kind=aliases.get(kind,kind)
+    if kind not in ('KONG','APIGEE','PROXY','MCP','API','OTHER'):raise ValueError('No runnable project found for target type '+target_type)
+    dependency='python -m pip install --quiet PyYAML==6.0.2 && ' if kind!='MCP' else ''
+    stage='TEST' if 'TEST' in checks else 'BUILD'
+    return 'python:3.12-slim',[(stage,dependency+'python /runner/validate_config_bundle.py '+kind+' /workspace')]
+
 def main():
     output=pathlib.Path('scan-output').resolve();output.mkdir(exist_ok=True)
     for key in ('SCAN_ID','EXECUTION_ID'):
@@ -166,18 +188,20 @@ def main():
             if hashlib.file_digest(source,'sha256').hexdigest()!=os.environ['ARTIFACT_SHA256']:raise ValueError('Bundle checksum mismatch')
         root=workspace/'source';root.mkdir();extract(archive,root)
         candidates=sorted(set(p.parent for p in root.rglob('*') if p.name in ('pom.xml','package.json','pyproject.toml','requirements.txt') and not any(x in p.parts for x in ('node_modules','.venv','target'))),key=lambda p:len(p.parts))
-        if not candidates:raise ValueError('No supported Maven, Node or Python project manifest found')
-        project=candidates[0]
-        if any(not p.is_relative_to(project) for p in candidates):raise ValueError('Multiple independent project roots require an explicit execution plan')
+        project=candidates[0] if candidates else root
+        if candidates and any(not p.is_relative_to(project) for p in candidates):raise ValueError('Multiple independent project roots require an explicit execution plan')
         for stale in project.rglob('*'):
             if stale.is_file() and (stale.name in ('jacoco.xml','coverage.xml','lcov.info','test-results.xml') or stale.name.startswith('TEST-') and stale.suffix=='.xml'):stale.unlink()
-        image,commands=plan(project,checks)
+        target_type=os.environ.get('TARGET_TYPE','').strip()
+        config_execution=not candidates
+        image,commands=plan(project,checks,target_type) if candidates else config_plan(project,checks,target_type)
         # Include the TemporaryDirectory parent as Docker must traverse every host path
         # component before it can enter the mounted project directory.
         make_workspace_writable(workspace)
         for index,(stage,command) in enumerate(commands):
             event(stage,runner=image,reason='Executing selected '+stage.lower()+' check');name='scan-'+os.environ['EXECUTION_ID']+'-'+str(index)
-            args=['docker','run','--name',name,*container_identity_args(),'--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--workdir=/workspace',image,'sh','-ec',command]
+            validator=pathlib.Path(__file__).with_name('validate_config_bundle.py').resolve()
+            args=['docker','run','--name',name,*container_identity_args(),'--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--mount',f'type=bind,src={validator},dst=/runner/validate_config_bundle.py,readonly','--workdir=/workspace',image,'sh','-ec',command]
             try:
                 with (output/(stage.lower()+'.log')).open('wb') as log:result=subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=1200)
             finally:subprocess.run(['docker','rm','-f',name],capture_output=True)
@@ -194,8 +218,12 @@ def main():
                 raise SystemExit(result.returncode)
         collect_reports(project,output)
         percent=None
-        if 'COVERAGE' in checks:event('COVERAGE',reason='Parsing actual test-runner coverage reports');percent=coverage(output)
-        event('COMPLETE',coveragePercent=percent,tests=test_counts(output),executedChecks=checks,reason='No coverage report produced' if 'COVERAGE' in checks and percent is None else 'Selected execution checks completed',workflowRunUrl=os.environ.get('GITHUB_SERVER_URL','')+'/'+os.environ.get('GITHUB_REPOSITORY','')+'/actions/runs/'+os.environ.get('GITHUB_RUN_ID',''))
+        if 'COVERAGE' in checks:
+            event('COVERAGE',reason='Configuration validation completed; line coverage is not applicable' if config_execution else 'Parsing actual test-runner coverage reports')
+            if not config_execution:percent=coverage(output)
+        reason=('Configuration validation completed; line coverage is not applicable' if config_execution and percent is None else
+                'No coverage report produced' if 'COVERAGE' in checks and percent is None else 'Selected execution checks completed')
+        event('COMPLETE',coveragePercent=percent,tests=test_counts(output),executedChecks=checks,reason=reason,workflowRunUrl=os.environ.get('GITHUB_SERVER_URL','')+'/'+os.environ.get('GITHUB_REPOSITORY','')+'/actions/runs/'+os.environ.get('GITHUB_RUN_ID',''))
 
 if __name__=='__main__':
     try:main()

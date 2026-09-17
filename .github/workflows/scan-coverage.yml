@@ -12,6 +12,9 @@ on:
       organization_id:
         required: true
         type: string
+      target_type:
+        required: true
+        type: string
       bundle_url:
         required: true
         type: string
@@ -56,6 +59,7 @@ jobs:
         env:
           SCAN_ID: ${{ inputs.scan_id }}
           EXECUTION_ID: ${{ inputs.execution_id }}
+          TARGET_TYPE: ${{ inputs.target_type }}
           BUNDLE_URL: ${{ inputs.bundle_url }}
           ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
           EXECUTION_CHECKS: ${{ inputs.execution_checks }}

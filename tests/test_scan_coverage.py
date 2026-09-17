@@ -46,6 +46,18 @@ class CoverageReports(unittest.TestCase):
         gid = getattr(os, 'getgid', lambda: 1000)()
         self.assertEqual(str(uid) + ':' + str(gid), args[1])
 
+    def test_kong_without_language_manifest_gets_real_validation_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image, commands = scanner.config_plan(pathlib.Path(directory), ['TEST', 'COVERAGE'], 'KONG_GATEWAY_SERVICE')
+            self.assertEqual('python:3.12-slim', image)
+            self.assertEqual('TEST', commands[0][0])
+            self.assertIn('validate_config_bundle.py KONG', commands[0][1])
+
+    def test_apigee_alias_gets_bundle_validation_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, commands = scanner.config_plan(pathlib.Path(directory), ['TEST'], 'APIGEE_PROXY')
+            self.assertIn('validate_config_bundle.py APIGEE', commands[0][1])
+
     def test_java_compile_only_plan_does_not_run_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -54,14 +66,24 @@ class CoverageReports(unittest.TestCase):
             self.assertEqual(['BUILD'], [stage for stage, _ in commands])
             self.assertNotIn(' test', commands[0][1])
 
-    def test_java_coverage_cleans_stale_output_and_does_not_duplicate_configured_agent(self):
+    def test_java_plugin_declaration_without_prepare_agent_gets_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / 'pom.xml').write_text('<artifactId>jacoco-maven-plugin</artifactId>')
             _, commands = scanner.plan(root, ['TEST', 'COVERAGE'])
             command = commands[0][1]
-            self.assertIn(' clean test ', command)
-            self.assertNotIn('prepare-agent', command)
+            self.assertIn('prepare-agent', command)
+
+    def test_java_active_prepare_agent_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'pom.xml').write_text('''<project><build><plugins><plugin>
+              <artifactId>jacoco-maven-plugin</artifactId><executions><execution><goals>
+              <goal>prepare-agent</goal></goals></execution></executions>
+              </plugin></plugins></build></project>''')
+            _, commands = scanner.plan(root, ['TEST', 'COVERAGE'])
+            self.assertNotIn(':prepare-agent', commands[0][1])
+            self.assertIn(':report', commands[0][1])
 
     def test_node_test_without_coverage_does_not_request_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
