@@ -60,6 +60,34 @@ class CoverageReports(unittest.TestCase):
             with self.assertRaises(ValueError):
                 scanner.extract(archive, root / 'source')
 
+    def test_disposable_workspace_is_writable_by_container_user(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            nested = root / 'src' / 'main'
+            nested.mkdir(parents=True)
+            source = nested / 'Application.java'
+            source.write_text('class Application {}')
+            root.chmod(0o700)
+            nested.chmod(0o500)
+            source.chmod(0o400)
+            scanner.make_workspace_writable(root)
+            self.assertTrue(root.stat().st_mode & 0o002)
+            self.assertTrue(nested.stat().st_mode & 0o002)
+            self.assertTrue(source.stat().st_mode & 0o002)
+
+    def test_failed_test_reports_can_be_collected_before_error_callback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            output = root / 'output'
+            project = root / 'project'
+            report = project / 'target' / 'surefire-reports' / 'TEST-AppTest.xml'
+            report.parent.mkdir(parents=True)
+            report.write_text('<testsuite><testcase name="passes"/><testcase name="fails"><failure/></testcase></testsuite>')
+            output.mkdir()
+            scanner.collect_reports(project, output)
+            self.assertEqual(1, scanner.test_counts(output)['passed'])
+            self.assertEqual(1, scanner.test_counts(output)['failed'])
+
 
 if __name__ == '__main__':
     unittest.main()

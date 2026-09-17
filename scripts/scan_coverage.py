@@ -48,6 +48,20 @@ def test_counts(reports):
             counts[status]+=1;counts['total']+=1
     return counts if found else None
 
+def make_workspace_writable(project):
+    """Allow a rootful or rootless Docker daemon to write to the disposable bind mount."""
+    paths=[project,*project.rglob('*')]
+    for path in paths:
+        if path.is_symlink():continue
+        mode=path.stat().st_mode
+        path.chmod(mode | 0o222 | (0o111 if path.is_dir() else 0))
+
+def collect_reports(project, output):
+    for report in project.rglob('*'):
+        if report.name in ('jacoco.xml','coverage.xml','lcov.info','test-results.xml') or report.name.startswith('TEST-') and report.suffix=='.xml':
+            if report.is_symlink() or not report.resolve().is_relative_to(project) or not report.is_file() or report.stat().st_size>20*1024*1024:continue
+            destination=output/report.relative_to(project);destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(report,destination)
+
 def plan(project,checks):
     if (project/'pom.xml').exists():
         commands=[]
@@ -106,24 +120,27 @@ def main():
         for stale in project.rglob('*'):
             if stale.is_file() and (stale.name in ('jacoco.xml','coverage.xml','lcov.info','test-results.xml') or stale.name.startswith('TEST-') and stale.suffix=='.xml'):stale.unlink()
         image,commands=plan(project,checks)
+        # Include the TemporaryDirectory parent as Docker must traverse every host path
+        # component before it can enter the mounted project directory.
+        make_workspace_writable(workspace)
         for index,(stage,command) in enumerate(commands):
             event(stage,runner=image,reason='Executing selected '+stage.lower()+' check');name='scan-'+os.environ['EXECUTION_ID']+'-'+str(index)
-            args=['docker','run','--name',name,'--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--workdir=/workspace',image,'sh','-ec',command]
+            args=['docker','run','--name',name,'--user','0:0','--cpus=2','--memory=2g','--pids-limit=256','--cap-drop=ALL','--security-opt=no-new-privileges','--mount',f'type=bind,src={project},dst=/workspace','--workdir=/workspace',image,'sh','-ec',command]
             try:
                 with (output/(stage.lower()+'.log')).open('wb') as log:result=subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=1200)
             finally:subprocess.run(['docker','rm','-f',name],capture_output=True)
+            collect_reports(project,output)
             if result.returncode!=0:
                 log_path=output/(stage.lower()+'.log')
                 tail=log_path.read_text(errors='replace')[-4000:] if log_path.exists() else ''
+                measured=coverage(output) if 'COVERAGE' in checks else None
                 event('ERROR',failedStage=stage,exitCode=result.returncode,
-                      reason=stage+' execution failed',logTail=tail)
+                      reason=stage+' execution failed',logTail=tail,
+                      tests=test_counts(output),coveragePercent=measured)
                 # Preserve the callback, but also make the GitHub job truthfully fail. Artifact
                 # upload still runs because the workflow step uses `if: always()`.
                 raise SystemExit(result.returncode)
-        for report in project.rglob('*'):
-            if report.name in ('jacoco.xml','coverage.xml','lcov.info','test-results.xml') or report.name.startswith('TEST-') and report.suffix=='.xml':
-                if report.is_symlink() or not report.resolve().is_relative_to(project) or not report.is_file() or report.stat().st_size>20*1024*1024:continue
-                destination=output/report.relative_to(project);destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(report,destination)
+        collect_reports(project,output)
         percent=None
         if 'COVERAGE' in checks:event('COVERAGE',reason='Parsing actual test-runner coverage reports');percent=coverage(output)
         event('COMPLETE',coveragePercent=percent,tests=test_counts(output),executedChecks=checks,reason='No coverage report produced' if 'COVERAGE' in checks and percent is None else 'Selected execution checks completed',workflowRunUrl=os.environ.get('GITHUB_SERVER_URL','')+'/'+os.environ.get('GITHUB_REPOSITORY','')+'/actions/runs/'+os.environ.get('GITHUB_RUN_ID',''))
