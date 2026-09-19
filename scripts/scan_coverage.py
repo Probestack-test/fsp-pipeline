@@ -49,6 +49,73 @@ def test_counts(reports):
             counts[status]+=1;counts['total']+=1
     return counts if found else None
 
+ANSI=re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+LOG_LIMIT=120000
+
+def clean_log(text):
+    return ANSI.sub('',text)
+
+def suite_details(reports):
+    """Per-suite results and the failed cases, from the runner's own JUnit reports. Empty when it wrote none."""
+    suites,failures={},[]
+    for report in sorted(reports.rglob('*.xml')):
+        if report.name!='test-results.xml' and not report.name.startswith('TEST-'):continue
+        for case in ET.parse(report).getroot().iter('testcase'):
+            name=case.get('classname') or report.stem
+            entry=suites.setdefault(name,dict(name=name,total=0,passed=0,failed=0,errors=0,skipped=0,seconds=0.0))
+            failure,error=case.find('failure'),case.find('error')
+            status='failed' if failure is not None else 'errors' if error is not None else 'skipped' if case.find('skipped') is not None else 'passed'
+            entry[status]+=1;entry['total']+=1
+            try:entry['seconds']+=float(case.get('time') or 0)
+            except ValueError:pass
+            if status in ('failed','errors') and len(failures)<50:
+                node=failure if failure is not None else error
+                failures.append(dict(suite=name,name=case.get('name') or '',message=(node.get('message') or node.text or '').strip()[:500]))
+    for entry in suites.values():entry['seconds']=round(entry['seconds'],3)
+    return list(suites.values())[:300],failures
+
+def words_to_counts(fragment):
+    """'1 failed, 5 passed, 2 skipped' -> counts; total is the sum unless it is given."""
+    counts=dict(total=0,passed=0,failed=0,errors=0,skipped=0)
+    for number,word in re.findall(r'(\d+)\s+(passed|failed|skipped|todo|errors?|total)',fragment):
+        number=int(number)
+        if word=='total':counts['total']=number
+        elif word.startswith('error'):counts['errors']+=number
+        elif word=='todo':counts['skipped']+=number
+        else:counts[word]+=number
+    counted=counts['passed']+counts['failed']+counts['errors']+counts['skipped']
+    counts['total']=max(counts['total'],counted)
+    return counts if counts['total'] else None
+
+def log_counts(text):
+    """The runner's own summary line, for a project whose test tool wrote no JUnit report (Maven, Vitest, Jest, pytest)."""
+    text=clean_log(text)
+    maven=re.findall(r'Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)\s*$',text,re.M)
+    if maven:
+        total,failed,errors,skipped=map(int,maven[-1])
+        return dict(total=total,passed=max(total-failed-errors-skipped,0),failed=failed,errors=errors,skipped=skipped)
+    for pattern in (r'^\s*Tests\s{2,}(.+?)\s*\(\d+\)\s*$',r'^\s*Tests:\s+(.+)$',r'^=+\s+(.+?)\s+in\s+[\d.]+s.*=+\s*$'):
+        found=re.findall(pattern,text,re.M)
+        if found:
+            counts=words_to_counts(found[-1])
+            if counts:return counts
+    return None
+
+def read_logs(output):
+    logs=[]
+    for stage in ('build','test'):
+        path=output/(stage+'.log')
+        if path.exists():logs.append(dict(stage=stage,text=clean_log(path.read_text(errors='replace'))[-LOG_LIMIT:]))
+    return logs
+
+def run_details(output):
+    """Everything worth showing about the run itself: counts, suites, failed cases and the full logs."""
+    suites,failures=suite_details(output)
+    counts=test_counts(output)
+    logs=read_logs(output)
+    if counts is None:counts=log_counts('\n'.join(log['text'] for log in logs if log['stage']=='test'))
+    return dict(tests=counts,suites=suites,failures=failures,logs=logs)
+
 def make_workspace_writable(project):
     """Allow a rootful or rootless Docker daemon to write to the disposable bind mount."""
     paths=[project,*project.rglob('*')]
@@ -130,6 +197,16 @@ def jacoco_agent_configured(project):
     except ET.ParseError:return False
     return False
 
+def node_test_command(project,scripts,coverage):
+    """npm test; for Vitest also asks for the JUnit report (test counts per suite) and the lcov report (coverage)."""
+    package=json.loads((project/'package.json').read_text())
+    dependencies={**package.get('dependencies',{}),**package.get('devDependencies',{})}
+    vitest='vitest' in dependencies or 'vitest' in scripts.get('test','')
+    args=[]
+    if vitest:args+=['--reporter=default','--reporter=junit','--outputFile.junit=test-results.xml']
+    if coverage:args+=['--coverage']+(['--coverage.reporter=lcov','--coverage.reporter=text-summary'] if vitest else [])
+    return 'npm test'+(' -- '+' '.join(args) if args else '')
+
 def plan(project,checks,target_type=''):
     if (project/'pom.xml').exists():
         commands=[]
@@ -150,7 +227,7 @@ def plan(project,checks,target_type=''):
             commands.append(('BUILD',install+' && '+build));install='true'
         if 'TEST' in checks:
             if not scripts.get('test'):raise ValueError('No existing Node test script')
-            commands.append(('TEST',install+' && '+('npm test -- --coverage' if 'COVERAGE' in checks else 'npm test')))
+            commands.append(('TEST',install+' && '+node_test_command(project,scripts,'COVERAGE' in checks)))
         return 'node:'+str(node_version(project))+'-bookworm-slim',commands
     install='if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi; if [ -f pyproject.toml ]; then python -m pip install .; fi';commands=[]
     if 'COMPILE' in checks:commands.append(('BUILD',install+'; python -m compileall -q .'));install='true'
@@ -212,7 +289,7 @@ def main():
                 measured=coverage(output) if 'COVERAGE' in checks else None
                 event('ERROR',failedStage=stage,exitCode=result.returncode,
                       reason=stage+' execution failed',logTail=tail,
-                      tests=test_counts(output),coveragePercent=measured)
+                      coveragePercent=measured,**run_details(output))
                 # Preserve the callback, but also make the GitHub job truthfully fail. Artifact
                 # upload still runs because the workflow step uses `if: always()`.
                 raise SystemExit(result.returncode)
@@ -223,7 +300,7 @@ def main():
             if not config_execution:percent=coverage(output)
         reason=('Configuration validation completed; line coverage is not applicable' if config_execution and percent is None else
                 'No coverage report produced' if 'COVERAGE' in checks and percent is None else 'Selected execution checks completed')
-        event('COMPLETE',coveragePercent=percent,tests=test_counts(output),executedChecks=checks,reason=reason,workflowRunUrl=os.environ.get('GITHUB_SERVER_URL','')+'/'+os.environ.get('GITHUB_REPOSITORY','')+'/actions/runs/'+os.environ.get('GITHUB_RUN_ID',''))
+        event('COMPLETE',coveragePercent=percent,executedChecks=checks,reason=reason,configValidation=config_execution,**run_details(output))
 
 if __name__=='__main__':
     try:main()

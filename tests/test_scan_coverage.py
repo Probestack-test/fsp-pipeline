@@ -147,5 +147,55 @@ class CoverageReports(unittest.TestCase):
             self.assertEqual(1, scanner.test_counts(output)['failed'])
 
 
+class RunDetails(unittest.TestCase):
+    def test_suites_and_failed_cases_come_from_the_junit_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'test-results.xml').write_text(
+                '<testsuites><testsuite>'
+                '<testcase classname="tests/a.test.ts" name="one" time="0.5"/>'
+                '<testcase classname="tests/a.test.ts" name="two" time="0.25"><failure message="boom"/></testcase>'
+                '<testcase classname="tests/b.test.ts" name="three"><skipped/></testcase>'
+                '</testsuite></testsuites>')
+            suites, failures = scanner.suite_details(root)
+            self.assertEqual(['tests/a.test.ts', 'tests/b.test.ts'], [s['name'] for s in suites])
+            self.assertEqual(dict(name='tests/a.test.ts', total=2, passed=1, failed=1, errors=0, skipped=0, seconds=0.75), suites[0])
+            self.assertEqual([dict(suite='tests/a.test.ts', name='two', message='boom')], failures)
+
+    def test_maven_summary_line_gives_the_counts_when_there_is_no_report(self):
+        log = ('[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.8 s - in a.B\n'
+               '[INFO] Results:\n[INFO] Tests run: 79, Failures: 1, Errors: 0, Skipped: 2\n')
+        self.assertEqual(dict(total=79, passed=76, failed=1, errors=0, skipped=2), scanner.log_counts(log))
+
+    def test_vitest_jest_and_pytest_summaries(self):
+        self.assertEqual(dict(total=19, passed=18, failed=1, errors=0, skipped=0),
+                         scanner.log_counts('\x1b[2m      Tests \x1b[22m  1 failed | 18 passed (19)\n'))
+        self.assertEqual(dict(total=6, passed=5, failed=1, errors=0, skipped=0), scanner.log_counts('Tests:       1 failed, 5 passed, 6 total\n'))
+        self.assertEqual(dict(total=7, passed=5, failed=1, errors=1, skipped=0), scanner.log_counts('==== 1 failed, 5 passed, 1 error in 0.42s ====\n'))
+
+    def test_a_log_without_a_summary_reports_nothing_instead_of_inventing_counts(self):
+        self.assertIsNone(scanner.log_counts('compiled successfully\n'))
+
+    def test_logs_are_kept_without_colour_codes_and_within_the_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            (output / 'test.log').write_text('\x1b[31mred\x1b[0m ' + 'x' * (scanner.LOG_LIMIT + 50))
+            log = scanner.read_logs(output)[0]
+            self.assertEqual('test', log['stage'])
+            self.assertNotIn('\x1b', log['text'])
+            self.assertEqual(scanner.LOG_LIMIT, len(log['text']))
+
+    def test_vitest_projects_also_get_junit_and_lcov(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'package.json').write_text('{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^2"}}')
+            command = scanner.node_test_command(root, {'test': 'vitest run'}, True)
+            self.assertIn('--reporter=junit', command)
+            self.assertIn('--coverage.reporter=lcov', command)
+            (root / 'package.json').write_text('{"scripts":{"test":"jest"},"devDependencies":{"jest":"^29"}}')
+            self.assertEqual('npm test -- --coverage', scanner.node_test_command(root, {'test': 'jest'}, True))
+            self.assertEqual('npm test', scanner.node_test_command(root, {'test': 'jest'}, False))
+
+
 if __name__ == '__main__':
     unittest.main()
