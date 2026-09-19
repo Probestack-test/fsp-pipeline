@@ -1,17 +1,30 @@
 """Run selected build/test checks; bundle code stays in a constrained container."""
-import hashlib, json, os, pathlib, re, shutil, subprocess, tempfile, urllib.request, zipfile
+import hashlib, json, os, pathlib, re, shutil, subprocess, tempfile, urllib.error, urllib.request, zipfile
 import xml.etree.ElementTree as ET
 MAX_ZIP, MAX_EXPANDED, sequence, terminal_event_sent = 100*1024*1024, 500*1024*1024, 0, False
 
 def event(stage, **details):
     global sequence, terminal_event_sent
     sequence += 1
-    if stage in ('ERROR','COMPLETE'):terminal_event_sent=True
     body = dict(executionId=os.environ['EXECUTION_ID'], artifactSha256=os.environ['ARTIFACT_SHA256'], sequence=sequence, stage=stage, **details)
     endpoint = os.environ['SCAN_API_URL'].rstrip('/')+'/v2/scans/'+os.environ['SCAN_ID']+'/execution-events'
     if not endpoint.startswith('https://'): raise ValueError('SCAN_API_URL must use HTTPS')
     request = urllib.request.Request(endpoint, json.dumps(body).encode(), {'Content-Type':'application/json','Authorization':'Bearer '+os.environ['SCAN_RUNNER_TOKEN']})
-    with urllib.request.urlopen(request, timeout=30) as response: response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response: response.read()
+    except urllib.error.HTTPError as error:
+        # Say what the service answered, so a rejected event can be diagnosed from the run's log.
+        print('::error::Execution event '+stage+' was rejected: HTTP '+str(error.code)+' '+error.read().decode(errors='replace')[:500],flush=True)
+        raise
+    if stage in ('ERROR','COMPLETE'):terminal_event_sent=True
+
+def send_final(stage, details, slim):
+    """Send the closing event with everything the run produced; if the service refuses it (too large, or a field it
+    cannot store), close the run with the essentials so it still finishes truthfully instead of hanging."""
+    try:event(stage,**details)
+    except urllib.error.HTTPError:
+        print('::warning::Retrying the '+stage+' event without the suite list and logs',flush=True)
+        event(stage,**slim)
 
 def extract(archive, root):
     with zipfile.ZipFile(archive) as bundle:
@@ -50,7 +63,7 @@ def test_counts(reports):
     return counts if found else None
 
 ANSI=re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
-LOG_LIMIT=120000
+LOG_LIMIT=24000
 
 def clean_log(text):
     return ANSI.sub('',text)
@@ -68,11 +81,11 @@ def suite_details(reports):
             entry[status]+=1;entry['total']+=1
             try:entry['seconds']+=float(case.get('time') or 0)
             except ValueError:pass
-            if status in ('failed','errors') and len(failures)<50:
+            if status in ('failed','errors') and len(failures)<30:
                 node=failure if failure is not None else error
                 failures.append(dict(suite=name,name=case.get('name') or '',message=(node.get('message') or node.text or '').strip()[:500]))
     for entry in suites.values():entry['seconds']=round(entry['seconds'],3)
-    return list(suites.values())[:300],failures
+    return list(suites.values())[:100],failures
 
 def words_to_counts(fragment):
     """'1 failed, 5 passed, 2 skipped' -> counts; total is the sum unless it is given."""
@@ -287,9 +300,11 @@ def main():
                 log_path=output/(stage.lower()+'.log')
                 tail=log_path.read_text(errors='replace')[-4000:] if log_path.exists() else ''
                 measured=coverage(output) if 'COVERAGE' in checks else None
-                event('ERROR',failedStage=stage,exitCode=result.returncode,
-                      reason=stage+' execution failed',logTail=tail,
-                      coveragePercent=measured,**run_details(output))
+                details=run_details(output)
+                send_final('ERROR',dict(failedStage=stage,exitCode=result.returncode,reason=stage+' execution failed',logTail=tail,
+                                        coveragePercent=measured,**details),
+                           dict(failedStage=stage,exitCode=result.returncode,reason=stage+' execution failed',logTail=tail,
+                                coveragePercent=measured,tests=details['tests']))
                 # Preserve the callback, but also make the GitHub job truthfully fail. Artifact
                 # upload still runs because the workflow step uses `if: always()`.
                 raise SystemExit(result.returncode)
@@ -300,7 +315,9 @@ def main():
             if not config_execution:percent=coverage(output)
         reason=('Configuration validation completed; line coverage is not applicable' if config_execution and percent is None else
                 'No coverage report produced' if 'COVERAGE' in checks and percent is None else 'Selected execution checks completed')
-        event('COMPLETE',coveragePercent=percent,executedChecks=checks,reason=reason,configValidation=config_execution,**run_details(output))
+        details=run_details(output)
+        send_final('COMPLETE',dict(coveragePercent=percent,executedChecks=checks,reason=reason,configValidation=config_execution,**details),
+                   dict(coveragePercent=percent,executedChecks=checks,reason=reason,configValidation=config_execution,tests=details['tests']))
 
 if __name__=='__main__':
     try:main()

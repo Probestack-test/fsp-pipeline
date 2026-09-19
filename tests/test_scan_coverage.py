@@ -197,5 +197,34 @@ class RunDetails(unittest.TestCase):
             self.assertEqual('npm test', scanner.node_test_command(root, {'test': 'jest'}, False))
 
 
+class FinalEvent(unittest.TestCase):
+    def test_the_closing_event_carries_everything_when_the_service_accepts_it(self):
+        sent = []
+        original = scanner.event
+        scanner.event = lambda stage, **details: sent.append((stage, sorted(details)))
+        try:
+            scanner.send_final('COMPLETE', dict(tests=None, suites=[], logs=[]), dict(tests=None))
+        finally:
+            scanner.event = original
+        self.assertEqual([('COMPLETE', ['logs', 'suites', 'tests'])], sent)
+
+    def test_a_refused_closing_event_is_retried_with_the_essentials_only(self):
+        import urllib.error
+        sent = []
+        original = scanner.event
+
+        def refuse_the_big_one(stage, **details):
+            sent.append(sorted(details))
+            if 'logs' in details:
+                raise urllib.error.HTTPError('https://x', 500, 'Internal Server Error', {}, None)
+
+        scanner.event = refuse_the_big_one
+        try:
+            scanner.send_final('COMPLETE', dict(tests=None, suites=[], logs=[]), dict(tests=None))
+        finally:
+            scanner.event = original
+        self.assertEqual([['logs', 'suites', 'tests'], ['tests']], sent)
+
+
 if __name__ == '__main__':
     unittest.main()
