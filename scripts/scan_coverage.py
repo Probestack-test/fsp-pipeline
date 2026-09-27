@@ -227,7 +227,14 @@ def plan(project,checks,target_type=''):
         if 'TEST' in checks:
             if 'COVERAGE' not in checks: command='mvn -B clean test'
             else:
-                report='org.jacoco:jacoco-maven-plugin:0.8.12:report'
+                # A failing test throws inside the 'test' phase, and by default Maven aborts the whole
+                # invocation right there — the jacoco:report goal (which runs after it) never gets to
+                # convert the already-recorded exec data into jacoco.xml, so coverage silently comes
+                # back "not measured" even though most tests passed. Ignoring test failures here only
+                # keeps that report goal running; a real compile error still fails this command (it
+                # happens earlier, before surefire), and the actual pass/fail counts below are read
+                # straight from surefire's own reports regardless of this flag.
+                report='-Dmaven.test.failure.ignore=true org.jacoco:jacoco-maven-plugin:0.8.12:report'
                 command=('mvn -B clean test '+report if jacoco_agent_configured(project) else
                          'mvn -B clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test '+report)
             commands.append(('TEST',command))
